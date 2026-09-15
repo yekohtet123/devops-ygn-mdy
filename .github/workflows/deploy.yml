@@ -1,4 +1,4 @@
-name: YGN-MDY CI/CD
+name: YGN-MDY Safe CI/CD
 
 on:
   push:
@@ -10,40 +10,133 @@ jobs:
     runs-on: self-hosted
 
     steps:
+
+      # -----------------------------------
+      # 1. Checkout Source Code
+      # -----------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build MDY Docker image
-        run: |
-          docker build -t mdy-app:v2 ./mdy
 
-      - name: Remove old MDY container
+      # -----------------------------------
+      # 2. Build New Docker Image
+      # -----------------------------------
+      - name: Build candidate Docker image
+        run: |
+          docker build \
+            -t mdy-app:${{ github.sha }} \
+            ./mdy
+
+
+      # -----------------------------------
+      # 3. Remove Previous Candidate
+      # -----------------------------------
+      - name: Remove old candidate
+        run: |
+          docker rm -f mdy-candidate || true
+
+
+      # -----------------------------------
+      # 4. Deploy New Version as Candidate
+      # Production is NOT touched here.
+      # -----------------------------------
+      - name: Deploy candidate
+        run: |
+          docker run -d \
+            --name mdy-candidate \
+            -p 8083:80 \
+            mdy-app:${{ github.sha }}
+
+
+      # -----------------------------------
+      # 5. Candidate Health Check
+      # -----------------------------------
+      - name: Health check candidate
+        run: |
+          echo "Checking candidate on port 8083..."
+
+          for i in {1..10}; do
+
+            if curl \
+              --fail \
+              --silent \
+              http://127.0.0.1:8083/health.html \
+              | grep -q "healthy"; then
+
+              echo "Candidate is HEALTHY"
+              exit 0
+
+            fi
+
+            echo "Health check attempt $i failed..."
+            sleep 2
+
+          done
+
+          echo "Candidate health check FAILED"
+
+          docker logs mdy-candidate || true
+          docker rm -f mdy-candidate || true
+
+          exit 1
+
+
+      # -----------------------------------
+      # 6. Candidate Passed
+      # Stop Current MDY Production
+      # -----------------------------------
+      - name: Stop old MDY production
         run: |
           docker rm -f mdy-app || true
 
-      - name: Deploy MDY container
+
+      # -----------------------------------
+      # 7. Promote Candidate Image
+      # Production runs on port 8082
+      # -----------------------------------
+      - name: Deploy new MDY production
         run: |
           docker run -d \
             --name mdy-app \
             -p 8082:80 \
-            mdy-app:v2
+            mdy-app:${{ github.sha }}
 
-      - name: Health check MDY
+
+      # -----------------------------------
+      # 8. Verify New Production Container
+      # BEFORE switching Nginx
+      # -----------------------------------
+      - name: Verify new MDY production
         run: |
-          echo "Checking MDY..."
+          echo "Checking new production container..."
+
           for i in {1..10}; do
-            if curl --fail --silent http://127.0.0.1:8082 > /dev/null; then
-              echo "MDY is healthy"
+
+            if curl \
+              --fail \
+              --silent \
+              http://127.0.0.1:8082/health.html \
+              | grep -q "healthy"; then
+
+              echo "New MDY production is HEALTHY"
               exit 0
             fi
+
+            echo "Production health check attempt $i failed..."
             sleep 2
+
           done
 
-          echo "MDY health check failed"
+          echo "New production health check FAILED"
           exit 1
 
-      - name: Switch production to MDY
+
+      # -----------------------------------
+      # 9. Switch Nginx to MDY
+      # -----------------------------------
+      - name: Switch production traffic to MDY
         run: |
+
           cat > /tmp/devops-lab.conf <<'EOF'
           server {
               listen 8080;
@@ -58,13 +151,34 @@ jobs:
           }
           EOF
 
-          sudo -n /usr/bin/install -m 644 \
+          sudo -n /usr/bin/install \
+            -m 644 \
             /tmp/devops-lab.conf \
             /etc/nginx/sites-available/devops-lab
 
           sudo -n /usr/sbin/nginx -t
+
           sudo -n /usr/bin/systemctl reload nginx
 
+
+      # -----------------------------------
+      # 10. Verify Public Production URL
+      # -----------------------------------
       - name: Verify production
         run: |
+
+          echo "Checking production through Nginx..."
+
           curl --fail http://127.0.0.1:8080
+
+          echo ""
+          echo "Production deployment successful!"
+
+
+      # -----------------------------------
+      # 11. Cleanup Candidate Container
+      # -----------------------------------
+      - name: Cleanup candidate
+        if: success()
+        run: |
+          docker rm -f mdy-candidate || true

@@ -1,4 +1,4 @@
-name: YGN-MDY Safe CI/CD
+name: YGN-MDY CI/CD with Automatic Rollback
 
 on:
   push:
@@ -11,35 +11,34 @@ jobs:
 
     steps:
 
-      # -----------------------------------
-      # 1. Checkout Source Code
-      # -----------------------------------
+      # ==========================================
+      # 1. Checkout
+      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
 
-      # -----------------------------------
-      # 2. Build New Docker Image
-      # -----------------------------------
-      - name: Build candidate Docker image
+      # ==========================================
+      # 2. Build new candidate image
+      # ==========================================
+      - name: Build candidate image
         run: |
           docker build \
             -t mdy-app:${{ github.sha }} \
             ./mdy
 
 
-      # -----------------------------------
-      # 3. Remove Previous Candidate
-      # -----------------------------------
+      # ==========================================
+      # 3. Remove old candidate container
+      # ==========================================
       - name: Remove old candidate
         run: |
           docker rm -f mdy-candidate || true
 
 
-      # -----------------------------------
-      # 4. Deploy New Version as Candidate
-      # Production is NOT touched here.
-      # -----------------------------------
+      # ==========================================
+      # 4. Run candidate on port 8083
+      # ==========================================
       - name: Deploy candidate
         run: |
           docker run -d \
@@ -48,32 +47,32 @@ jobs:
             mdy-app:${{ github.sha }}
 
 
-      # -----------------------------------
-      # 5. Candidate Health Check
-      # -----------------------------------
+      # ==========================================
+      # 5. Candidate health check
+      #
+      # If this fails, production is untouched.
+      # ==========================================
       - name: Health check candidate
         run: |
-          echo "Checking candidate on port 8083..."
+          echo "Checking candidate..."
 
           for i in {1..10}; do
 
-            if curl \
-              --fail \
-              --silent \
+            if curl --fail --silent \
               http://127.0.0.1:8083/health.html \
-              | grep -q "healthy"; then
+              | grep -qx "healthy"; then
 
               echo "Candidate is HEALTHY"
               exit 0
 
             fi
 
-            echo "Health check attempt $i failed..."
+            echo "Attempt $i failed..."
             sleep 2
 
           done
 
-          echo "Candidate health check FAILED"
+          echo "Candidate FAILED health check"
 
           docker logs mdy-candidate || true
           docker rm -f mdy-candidate || true
@@ -81,20 +80,37 @@ jobs:
           exit 1
 
 
-      # -----------------------------------
-      # 6. Candidate Passed
-      # Stop Current MDY Production
-      # -----------------------------------
-      - name: Stop old MDY production
+      # ==========================================
+      # 6. Save current production for rollback
+      #
+      # production = current good image
+      # rollback   = backup of current production
+      # ==========================================
+      - name: Save rollback image
+        run: |
+          echo "Saving current production image..."
+
+          docker image inspect mdy-app:production > /dev/null
+
+          docker tag \
+            mdy-app:production \
+            mdy-app:rollback
+
+          echo "Rollback image saved."
+
+
+      # ==========================================
+      # 7. Remove current production container
+      # ==========================================
+      - name: Stop current production
         run: |
           docker rm -f mdy-app || true
 
 
-      # -----------------------------------
-      # 7. Promote Candidate Image
-      # Production runs on port 8082
-      # -----------------------------------
-      - name: Deploy new MDY production
+      # ==========================================
+      # 8. Deploy new version to production
+      # ==========================================
+      - name: Deploy new production
         run: |
           docker run -d \
             --name mdy-app \
@@ -102,41 +118,114 @@ jobs:
             mdy-app:${{ github.sha }}
 
 
-      # -----------------------------------
-      # 8. Verify New Production Container
-      # BEFORE switching Nginx
-      # -----------------------------------
-      - name: Verify new MDY production
+      # ==========================================
+      # 9. Verify new production
+      #
+      # Do NOT fail this step immediately.
+      # Save result for rollback decision.
+      # ==========================================
+      - name: Verify new production
+        id: production_check
         run: |
-          echo "Checking new production container..."
+          echo "Checking new production..."
+
+          HEALTHY=false
 
           for i in {1..10}; do
 
-            if curl \
-              --fail \
-              --silent \
+            if curl --fail --silent \
               http://127.0.0.1:8082/health.html \
-              | grep -q "healthy"; then
+              | grep -qx "healthy"; then
 
-              echo "New MDY production is HEALTHY"
-              exit 0
+              HEALTHY=true
+              break
+
             fi
 
-            echo "Production health check attempt $i failed..."
+            echo "Production check attempt $i failed..."
             sleep 2
 
           done
 
-          echo "New production health check FAILED"
+          if [ "$HEALTHY" = "true" ]; then
+
+            echo "New production is HEALTHY"
+
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "New production is UNHEALTHY"
+
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # ==========================================
+      # 10. Rollback if new production failed
+      # ==========================================
+      - name: Automatic rollback
+        if: steps.production_check.outputs.healthy != 'true'
+        run: |
+          echo "================================="
+          echo "NEW PRODUCTION FAILED"
+          echo "STARTING AUTOMATIC ROLLBACK"
+          echo "================================="
+
+          docker rm -f mdy-app || true
+
+          docker run -d \
+            --name mdy-app \
+            -p 8082:80 \
+            mdy-app:rollback
+
+          echo "Waiting for rollback container..."
+          sleep 2
+
+          curl --fail \
+            http://127.0.0.1:8082/health.html \
+            | grep -qx "healthy"
+
+          echo "ROLLBACK SUCCESSFUL"
+
+
+      # ==========================================
+      # 11. Fail pipeline after successful rollback
+      #
+      # Important:
+      # Production is restored, but GitHub Actions
+      # should still show that this release failed.
+      # ==========================================
+      - name: Mark deployment as failed
+        if: steps.production_check.outputs.healthy != 'true'
+        run: |
+          echo "Deployment failed."
+          echo "Previous production version was restored."
           exit 1
 
 
-      # -----------------------------------
-      # 9. Switch Nginx to MDY
-      # -----------------------------------
-      - name: Switch production traffic to MDY
+      # ==========================================
+      # 12. Mark new image as production
+      #
+      # Only runs when new production is healthy.
+      # ==========================================
+      - name: Update production image tag
+        if: steps.production_check.outputs.healthy == 'true'
         run: |
+          docker tag \
+            mdy-app:${{ github.sha }} \
+            mdy-app:production
 
+          echo "Production tag updated."
+
+
+      # ==========================================
+      # 13. Configure / reload Nginx
+      # ==========================================
+      - name: Switch Nginx to production
+        if: steps.production_check.outputs.healthy == 'true'
+        run: |
           cat > /tmp/devops-lab.conf <<'EOF'
           server {
               listen 8080;
@@ -157,28 +246,27 @@ jobs:
             /etc/nginx/sites-available/devops-lab
 
           sudo -n /usr/sbin/nginx -t
-
           sudo -n /usr/bin/systemctl reload nginx
 
 
-      # -----------------------------------
-      # 10. Verify Public Production URL
-      # -----------------------------------
-      - name: Verify production
+      # ==========================================
+      # 14. Final production verification
+      # ==========================================
+      - name: Verify public production
+        if: steps.production_check.outputs.healthy == 'true'
         run: |
-
           echo "Checking production through Nginx..."
 
           curl --fail http://127.0.0.1:8080
 
           echo ""
-          echo "Production deployment successful!"
+          echo "DEPLOYMENT SUCCESSFUL"
 
 
-      # -----------------------------------
-      # 11. Cleanup Candidate Container
-      # -----------------------------------
+      # ==========================================
+      # 15. Cleanup candidate
+      # ==========================================
       - name: Cleanup candidate
-        if: success()
+        if: always()
         run: |
           docker rm -f mdy-candidate || true

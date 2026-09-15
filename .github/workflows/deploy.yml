@@ -1,0 +1,34 @@
+name: YGN-MDY CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build MDY Docker image
+        run: |
+          docker build -t mdy-app:v2 ./mdy
+
+      - name: Remove old MDY container
+        run: |
+          docker rm -f mdy-app || true
+
+      - name: Deploy MDY container
+        run: |
+          docker run -d \
+            --name mdy-app \
+            -p 8082:80 \
+            mdy-app:v2
+
+      - name: Health check
+        run: |
+          sleep 2
+          curl --fail http://localhost:8082

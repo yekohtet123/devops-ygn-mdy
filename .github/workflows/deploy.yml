@@ -133,12 +133,6 @@ jobs:
 
           for i in {1..10}; do
 
-            # Simulate production failure for Version 5
-            if grep -q "Version 5.0" mdy/index.html; then
-              echo "Simulating production failure for Version 5.0"
-              break
-            fi
-
             if curl --fail --silent \
               http://127.0.0.1:8082/health.html \
               | grep -qx "healthy"; then

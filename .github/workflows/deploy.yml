@@ -28,7 +28,43 @@ jobs:
             -p 8082:80 \
             mdy-app:v2
 
-      - name: Health check
+      - name: Health check MDY
         run: |
-          sleep 2
-          curl --fail http://localhost:8082
+          echo "Checking MDY..."
+          for i in {1..10}; do
+            if curl --fail --silent http://127.0.0.1:8082 > /dev/null; then
+              echo "MDY is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "MDY health check failed"
+          exit 1
+
+      - name: Switch production to MDY
+        run: |
+          cat > /tmp/devops-lab.conf <<'EOF'
+          server {
+              listen 8080;
+
+              location / {
+                  proxy_pass http://127.0.0.1:8082;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+          }
+          EOF
+
+          sudo -n /usr/bin/install -m 644 \
+            /tmp/devops-lab.conf \
+            /etc/nginx/sites-available/devops-lab
+
+          sudo -n /usr/sbin/nginx -t
+          sudo -n /usr/bin/systemctl reload nginx
+
+      - name: Verify production
+        run: |
+          curl --fail http://127.0.0.1:8080
